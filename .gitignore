@@ -1,0 +1,4 @@
+cookies.txt
+*.cookies.txt
+bandcamp/
+__pycache__/
