@@ -6,7 +6,9 @@ Downloads every purchase in your Bandcamp collection in the format you pick
 
 ## Setup
 
-    pip install -r requirements.txt      # only needs `requests`
+    pip install -r requirements.txt      # requests (+ textual for the TUI)
+
+On Debian/Ubuntu: `apt install python3-requests python3-textual`.
 
 ## Log in (borrow your browser session)
 
@@ -24,7 +26,34 @@ browser that is already logged in. Either:
 
 Treat the cookie like a password; it is your logged-in session.
 
-## Use
+## Terminal UI
+
+    ./bandcamp_tui.py
+
+![TUI](docs/tui.png)
+
+* **Cookie** — paste the `identity` value into the box (ctrl+v, or your
+  terminal's paste). Pasting `identity=…`, a quoted value or a whole
+  `Cookie:` header also works; it is trimmed to the value. *Show* reveals
+  it. Tick *Remember* to keep it in `~/.config/bandcamp-dl/identity`
+  (mode 0600); otherwise it is not written anywhere. `BANDCAMP_IDENTITY`
+  pre-fills it.
+* **Folder** — type a path (created if missing; Enter browses there) or
+  pick one in the tree; `↑` goes to the parent, `~` home.
+* **Format** — a first choice and an optional fallback, plus parallel
+  downloads, hidden items, keep zips and force.
+* **Run** — *Check login* (ctrl+l), *Dry run* (ctrl+n), *Download*
+  (ctrl+d), *Stop* (ctrl+s; running files finish, the rest are dropped).
+  Progress bar with ETA, coloured log (done / retry / failed).
+* **Theme** — pick one in the settings or cycle with F2; `bandcamp`
+  (default) and `bandcamp-light` plus Textual's built-ins (nord, gruvbox,
+  dracula, tokyo-night, catppuccin, solarized, …). Also in the ctrl+p
+  palette.
+
+Settings and theme are saved in `~/.config/bandcamp-dl/config.json`.
+Same state file as the CLI, so the two can be mixed.
+
+## Command line
 
     ./bandcamp_dl.py -f flac -o ~/Music/Bandcamp --dry-run   # see the list
     ./bandcamp_dl.py -f flac -o ~/Music/Bandcamp             # download

@@ -1,1 +1,2 @@
 requests>=2.25
+textual>=2.1   # TUI only

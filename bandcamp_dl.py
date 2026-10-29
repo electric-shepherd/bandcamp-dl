@@ -170,7 +170,11 @@ def filename_from(resp, fallback):
     return fallback
 
 
-def download_file(s, url, dest_dir, fallback_name, retries):
+def _stderr(msg):
+    print(msg, file=sys.stderr)
+
+
+def download_file(s, url, dest_dir, fallback_name, retries, log=_stderr):
     dest_dir.mkdir(parents=True, exist_ok=True)
     for attempt in range(1, retries + 1):
         try:
@@ -188,7 +192,7 @@ def download_file(s, url, dest_dir, fallback_name, retries):
         except (requests.RequestException, BandcampError) as e:
             if attempt == retries:
                 raise
-            print(f"    retry {attempt}/{retries - 1}: {e}", file=sys.stderr)
+            log(f"    retry {attempt}/{retries - 1}: {e}")
             time.sleep(5 * attempt)
 
 
@@ -214,16 +218,73 @@ def save_state(out, state):
     tmp.replace(out / STATE_FILE)
 
 
-def process(s, args, item, url):
+def process(s, args, item, url, log=_stderr):
     artist = safe_name(item.get("band_name"))
     title = safe_name(item.get("item_title") or item.get("album_title"))
     dest = args.output / artist / title
     blob = page_blob(s, url)
     fmt, file_url = pick_download(blob, args.format)
-    path = download_file(s, file_url, dest, f"{title}.{fmt}", args.retries)
+    path = download_file(s, file_url, dest, f"{title}.{fmt}", args.retries,
+                         log)
     if not args.keep_zip:
         unpack(path, dest)
     return fmt, dest
+
+
+def build_todo(items, state, args, log=print):
+    """Split the collection into what still needs downloading."""
+    todo, skipped = [], 0
+    for item, url in items:
+        key = f"{item.get('sale_item_type')}{item.get('sale_item_id')}"
+        label = f"{item.get('band_name')} - {item.get('item_title')}"
+        if not url:
+            log(f"  no download (preorder/subscription?): {label}")
+            skipped += 1
+        elif not args.force and state.get(key, {}).get("format") in args.format:
+            skipped += 1
+        else:
+            todo.append((key, label, item, url))
+    if args.limit:
+        todo = todo[:args.limit]
+    return todo, skipped
+
+
+def download_all(s, args, todo, state, on_done, log=_stderr, stop=None):
+    """Download todo with args.jobs workers; return the failed labels.
+
+    on_done(n, label, fmt, error) is called once per item as it finishes.
+    If `stop` (a threading.Event) gets set, queued items are dropped and
+    the ones already running are allowed to finish.
+    """
+    def run(item, url):
+        if stop is not None and stop.is_set():
+            return None  # stopped before this one began
+        return process(s, args, item, url, log)
+
+    failed = []
+    pool = ThreadPoolExecutor(max_workers=max(1, args.jobs))
+    try:
+        futures = {pool.submit(run, item, url): (key, label)
+                   for key, label, item, url in todo}
+        n = 0
+        for fut in as_completed(futures):
+            key, label = futures[fut]
+            if fut.exception() is None and fut.result() is None:
+                continue  # skipped by stop
+            n += 1
+            try:
+                fmt, dest = fut.result()
+            except Exception as e:  # keep going; report at the end
+                failed.append(label)
+                on_done(n, label, None, e)
+            else:
+                state[key] = {"format": fmt, "path": str(dest),
+                              "title": label, "at": int(time.time())}
+                save_state(args.output, state)
+                on_done(n, label, fmt, None)
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    return failed
 
 
 def main():
@@ -270,19 +331,7 @@ def main():
 
     args.output.mkdir(parents=True, exist_ok=True)
     state = load_state(args.output)
-    todo, skipped = [], 0
-    for item, url in items:
-        key = f"{item.get('sale_item_type')}{item.get('sale_item_id')}"
-        label = f"{item.get('band_name')} - {item.get('item_title')}"
-        if not url:
-            print(f"  no download (preorder/subscription?): {label}")
-            skipped += 1
-        elif not args.force and state.get(key, {}).get("format") in args.format:
-            skipped += 1
-        else:
-            todo.append((key, label, item, url))
-    if args.limit:
-        todo = todo[:args.limit]
+    todo, skipped = build_todo(items, state, args)
     print(f"{len(todo)} to download, {skipped} skipped")
 
     if args.dry_run:
@@ -290,22 +339,13 @@ def main():
             print(f"  {label}")
         return
 
-    failed = []
-    with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        futures = {pool.submit(process, s, args, item, url): (key, label)
-                   for key, label, item, url in todo}
-        for n, fut in enumerate(as_completed(futures), 1):
-            key, label = futures[fut]
-            try:
-                fmt, dest = fut.result()
-            except Exception as e:  # keep going; report at the end
-                print(f"[{n}/{len(todo)}] FAILED {label}: {e}")
-                failed.append(label)
-                continue
+    def report(n, label, fmt, error):
+        if error:
+            print(f"[{n}/{len(todo)}] FAILED {label}: {error}")
+        else:
             print(f"[{n}/{len(todo)}] {fmt:<13} {label}")
-            state[key] = {"format": fmt, "path": str(dest),
-                          "title": label, "at": int(time.time())}
-            save_state(args.output, state)
+
+    failed = download_all(s, args, todo, state, report)
 
     print(f"done: {len(todo) - len(failed)} downloaded, {len(failed)} failed")
     if failed:
