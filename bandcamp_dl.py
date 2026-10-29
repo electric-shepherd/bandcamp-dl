@@ -3,7 +3,9 @@
 
 Bandcamp has no public login API (the login form has a captcha), so the
 script borrows the session of a browser that is already logged in: either
-a Netscape cookies.txt export or just the value of the `identity` cookie.
+a Netscape cookies.txt export, the value of the `identity` cookie, or the
+cookie read straight out of Safari / Chrome (browser_cookies.py). `--login`
+saves it to ~/.config/bandcamp-dl/identity so later runs need no options.
 
 Flow:
   1. /api/fan/2/collection_summary          -> fan_id (proves the login works)
@@ -16,6 +18,7 @@ Flow:
 """
 
 import argparse
+import getpass
 import html
 import http.cookiejar
 import json
@@ -41,6 +44,10 @@ ALIASES = {"mp3": "mp3-320", "v0": "mp3-v0", "ogg": "vorbis",
            "aac": "aac-hi", "m4a": "aac-hi", "aiff": "aiff-lossless"}
 
 STATE_FILE = ".bandcamp-dl-state.json"
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME",
+                                 Path.home() / ".config")) / "bandcamp-dl"
+IDENTITY_FILE = CONFIG_DIR / "identity"
 
 
 class BandcampError(Exception):
@@ -68,21 +75,92 @@ def safe_name(text, limit=120):
     return text[:limit]
 
 
+def clean_identity(raw):
+    """Accept whatever got pasted: the bare value, `identity=...`, a quoted
+    value, or a whole `Cookie:` header / document.cookie string."""
+    raw = raw.strip().strip("'\"").strip()
+    if raw.lower().startswith("cookie:"):
+        raw = raw[7:].strip()
+    m = re.search(r"(?:^|;\s*)identity=([^;]*)", raw)
+    if m:
+        raw = m.group(1)
+    raw = raw.strip().strip("'\"").strip()
+    # Browsers show it either %-encoded or decoded; Bandcamp wants encoded.
+    if "\t" in raw or " " in raw:
+        raw = raw.replace("\t", "%09").replace(" ", "%20")
+    return raw
+
+
+def saved_identity():
+    try:
+        return IDENTITY_FILE.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def save_identity(identity):
+    """Store the cookie readable by this user only (None deletes it)."""
+    if not identity:
+        IDENTITY_FILE.unlink(missing_ok=True)
+        return
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(IDENTITY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(identity)
+
+
+def browser_identity(browser, profile=None):
+    import browser_cookies  # only needed for --from-browser
+    try:
+        return clean_identity(browser_cookies.get_identity(browser, profile))
+    except browser_cookies.BrowserCookieError as e:
+        raise BandcampError(str(e))
+
+
 def make_session(args):
+    """Session with the identity cookie from, in order: --identity,
+    BANDCAMP_IDENTITY, --from-browser, --cookies, the saved login."""
     s = requests.Session()
     s.headers["User-Agent"] = USER_AGENT
-    if args.cookies:
+    identity = (getattr(args, "identity", None)
+                or os.environ.get("BANDCAMP_IDENTITY"))
+    if not identity and getattr(args, "from_browser", None):
+        identity = browser_identity(args.from_browser,
+                                    getattr(args, "profile", None))
+    if getattr(args, "cookies", None):
         jar = http.cookiejar.MozillaCookieJar(args.cookies)
         jar.load(ignore_discard=True, ignore_expires=True)
         s.cookies.update(jar)
-    identity = args.identity or os.environ.get("BANDCAMP_IDENTITY")
+    if not identity and "identity" not in s.cookies.keys():
+        identity = saved_identity()
     if identity:
-        s.cookies.set("identity", identity, domain=".bandcamp.com")
+        s.cookies.set("identity", clean_identity(identity),
+                      domain=".bandcamp.com")
     if "identity" not in s.cookies.keys():
         raise BandcampError(
-            "no 'identity' cookie: pass --cookies cookies.txt, --identity, "
-            "or set BANDCAMP_IDENTITY (see README)")
+            "not logged in: run --login (once), or pass --from-browser, "
+            "--identity or --cookies (see README)")
     return s
+
+
+def login(args):
+    """--login: get the cookie, check it with Bandcamp, save it."""
+    identity = (args.identity or os.environ.get("BANDCAMP_IDENTITY")
+                or (args.from_browser
+                    and browser_identity(args.from_browser, args.profile)))
+    if not identity:
+        print("Paste the value of the bandcamp.com 'identity' cookie "
+              "(input is hidden; see README for where to find it).")
+        identity = getpass.getpass("identity: ")
+    identity = clean_identity(identity)
+    if not identity:
+        raise BandcampError("no cookie given")
+    s = requests.Session()
+    s.headers["User-Agent"] = USER_AGENT
+    s.cookies.set("identity", identity, domain=".bandcamp.com")
+    fan_id, user = get_fan_id(s)
+    save_identity(identity)
+    print(f"Logged in as {user} (fan {fan_id}); saved to {IDENTITY_FILE}")
 
 
 def get_fan_id(s):
@@ -300,6 +378,18 @@ def main():
                    "from a browser logged in to bandcamp.com")
     p.add_argument("-i", "--identity", help="value of the bandcamp.com "
                    "'identity' cookie (or set BANDCAMP_IDENTITY)")
+    p.add_argument("-b", "--from-browser", metavar="BROWSER",
+                   choices=["safari", "chrome", "chromium", "brave", "edge"],
+                   help="read the cookie from a logged-in browser: safari, "
+                        "chrome, chromium, brave or edge")
+    p.add_argument("--profile", help="browser profile for --from-browser "
+                   "(e.g. 'Profile 1'; default: the most recently used)")
+    p.add_argument("--login", action="store_true",
+                   help="check the cookie (from --from-browser, --identity "
+                        "or a hidden prompt) and save it for later runs, "
+                        f"in {IDENTITY_FILE}")
+    p.add_argument("--logout", action="store_true",
+                   help="delete the saved cookie")
     p.add_argument("-j", "--jobs", type=int, default=3,
                    help="parallel downloads (default 3; be polite)")
     p.add_argument("--retries", type=int, default=3)
@@ -315,6 +405,17 @@ def main():
     args = p.parse_args()
     if isinstance(args.format, str):  # argparse skips type= for defaults
         args.format = resolve_formats(args.format)
+
+    if args.logout:
+        save_identity(None)
+        print(f"removed {IDENTITY_FILE}")
+        return
+    if args.login:
+        try:
+            login(args)
+        except (BandcampError, OSError, requests.RequestException) as e:
+            sys.exit(f"error: {e}")
+        return
 
     try:
         s = make_session(args)

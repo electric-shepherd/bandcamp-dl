@@ -9,7 +9,6 @@ Settings (not the cookie, unless you tick "Remember") are kept in
 import argparse
 import json
 import os
-import re
 import threading
 from pathlib import Path
 
@@ -27,10 +26,13 @@ import bandcamp_dl as bc
 # "no choice" marker: Select.BLANK up to Textual 2.x, Select.NULL after.
 NO_SELECTION = getattr(Select, "NULL", None) or Select.BLANK
 
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME",
-                                 Path.home() / ".config")) / "bandcamp-dl"
+CONFIG_DIR = bc.CONFIG_DIR
 CONFIG_FILE = CONFIG_DIR / "config.json"
-IDENTITY_FILE = CONFIG_DIR / "identity"
+IDENTITY_FILE = bc.IDENTITY_FILE
+clean_identity = bc.clean_identity
+
+BROWSERS = [("Safari", "safari"), ("Chrome", "chrome"),
+            ("Chromium", "chromium"), ("Brave", "brave"), ("Edge", "edge")]
 
 FORMAT_LABELS = {
     "flac": "FLAC", "wav": "WAV", "vorbis": "Ogg Vorbis",
@@ -51,22 +53,6 @@ THEMES = [
 ]
 
 
-def clean_identity(raw):
-    """Accept whatever got pasted: the bare value, `identity=...`, a quoted
-    value, or a whole `Cookie:` header / document.cookie string."""
-    raw = raw.strip().strip("'\"").strip()
-    if raw.lower().startswith("cookie:"):
-        raw = raw[7:].strip()
-    m = re.search(r"(?:^|;\s*)identity=([^;]*)", raw)
-    if m:
-        raw = m.group(1)
-    raw = raw.strip().strip("'\"").strip()
-    # Browsers show it either %-encoded or decoded; Bandcamp wants encoded.
-    if "\t" in raw or " " in raw:
-        raw = raw.replace("\t", "%09").replace(" ", "%20")
-    return raw
-
-
 def tilde(path):
     """/home/me/Music -> ~/Music, for display."""
     try:
@@ -85,13 +71,7 @@ def load_config():
 def save_config(cfg, identity=None):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(cfg, indent=1, sort_keys=True))
-    if identity:
-        fd = os.open(IDENTITY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                     0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(identity)
-    else:
-        IDENTITY_FILE.unlink(missing_ok=True)
+    bc.save_identity(identity)
 
 
 class FolderTree(DirectoryTree):
@@ -114,7 +94,8 @@ class BandcampTUI(App):
     #settings, #folder { border-title-color: $accent;
                          border-title-style: bold; }
     .field { color: $text-muted; margin-top: 1; }
-    #cookie-row { height: auto; }
+    #cookie-row, #browser-row { height: auto; }
+    #browser { width: 1fr; }
     #identity { width: 1fr; }
     #show { min-width: 8; width: 8; margin-left: 1; }
     #login-status { height: auto; margin-top: 1; }
@@ -177,6 +158,10 @@ class BandcampTUI(App):
                     yield Input(identity, placeholder="7%09abc...",
                                 password=True, id="identity")
                     yield Button("Show", id="show")
+                with Horizontal(id="browser-row"):
+                    yield Select(BROWSERS, value=cfg.get("browser", "safari"),
+                                 allow_blank=False, id="browser")
+                    yield Button("Get from browser", id="get-cookie")
                 yield Checkbox("Remember cookie on this computer",
                                bool(IDENTITY_FILE.exists()), id="remember")
                 yield Label("", id="login-status")
@@ -225,8 +210,8 @@ class BandcampTUI(App):
         yield Footer()
 
     def on_mount(self):
-        self.info("Paste your bandcamp.com 'identity' cookie, pick a "
-                  "folder, then Dry run or Download.")
+        self.info("Paste your bandcamp.com 'identity' cookie (or Get from "
+                  "browser), pick a folder, then Dry run or Download.")
 
     @staticmethod
     def _browse_root(out):
@@ -328,6 +313,34 @@ class BandcampTUI(App):
         box = self.query_one("#identity", Input)
         box.password = not box.password
         event.button.label = "Hide" if not box.password else "Show"
+
+    @on(Button.Pressed, "#get-cookie")
+    def get_cookie(self, event):
+        browser = self.query_one("#browser", Select).value
+        self.cfg["browser"] = browser
+        event.button.disabled = True
+        self.info(f"reading the bandcamp.com cookie from {browser} "
+                  "(macOS may ask to allow keychain access)…")
+        self.read_browser_cookie(browser)
+
+    @work(thread=True, exclusive=True, group="browser")
+    def read_browser_cookie(self, browser):
+        ui = self.from_thread
+        try:
+            identity = bc.browser_identity(browser)
+        except Exception as e:
+            ui(self.err, f"{browser}: {e}")
+        else:
+            ui(self._got_cookie, browser, identity)
+        finally:
+            ui(self._enable_get_cookie)
+
+    def _got_cookie(self, browser, identity):
+        self.query_one("#identity", Input).value = identity
+        self.ok(f"got the cookie from {browser}; Check login to test it")
+
+    def _enable_get_cookie(self):
+        self.query_one("#get-cookie", Button).disabled = False
 
     @on(Input.Changed, "#identity")
     def tidy_identity(self, event):
